@@ -1,0 +1,153 @@
+import cv2
+import numpy as np
+import threading
+import time
+
+URLS = [
+    "rtsp://admin:TPT2025!@167.205.48.183/",
+    "rtsp://admin:TPT2025!@167.205.48.184/",
+    "rtsp://admin:TPT2025!@167.205.48.185/",
+]
+
+MAX_WIDTH = 1920
+MAX_HEIGHT = 1080
+
+COLS = 2
+ROWS = 2
+
+TILE_W = MAX_WIDTH // COLS
+TILE_H = MAX_HEIGHT // ROWS
+
+
+def make_placeholder(text, w=TILE_W, h=TILE_H):
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(img, text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    return img
+
+
+def resize_with_letterbox(frame, target_w, target_h):
+    h, w = frame.shape[:2]
+    if h == 0 or w == 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas[y:y + new_h, x:x + new_w] = resized
+    return canvas
+
+
+class StreamReader(threading.Thread):
+    def __init__(self, url, idx):
+        super().__init__(daemon=True)
+        self.url = url
+        self.idx = idx
+        self.cap = None
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ok = False
+        self.running = True
+
+    def open(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except:
+                pass
+
+        self.cap = cv2.VideoCapture(self.url)
+
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except:
+            pass
+
+        self.ok = self.cap.isOpened()
+        return self.ok
+
+    def run(self):
+        while self.running:
+            if self.cap is None or not self.ok:
+                self.open()
+                if not self.ok:
+                    time.sleep(1.0)
+                    continue
+
+            ret, frm = self.cap.read()
+            if not ret or frm is None:
+                self.ok = False
+                time.sleep(0.5)
+                continue
+
+            with self.lock:
+                self.frame = frm
+
+    def get_frame(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+    def stop(self):
+        self.running = False
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except:
+                pass
+
+
+def main():
+    readers = [StreamReader(url, i) for i, url in enumerate(URLS)]
+    for r in readers:
+        r.start()
+
+    cv2.namedWindow("CCTV Multi View", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("CCTV Multi View", MAX_WIDTH, MAX_HEIGHT)
+
+    while True:
+        # Canvas gabungan 2x2
+        mosaic = np.zeros((TILE_H * ROWS, TILE_W * COLS, 3), dtype=np.uint8)
+
+        tiles = []
+        for i, r in enumerate(readers):
+            frm = r.get_frame()
+            if frm is None:
+                tile = make_placeholder(f"CAM {i+1}: NO SIGNAL")
+            else:
+                tile = resize_with_letterbox(frm, TILE_W, TILE_H)
+                cv2.putText(tile, f"CAM {i+1}", (15, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+            tiles.append(tile)
+
+        while len(tiles) < ROWS * COLS:
+            tiles.append(make_placeholder(""))
+
+        k = 0
+        for rr in range(ROWS):
+            for cc in range(COLS):
+                y1 = rr * TILE_H
+                y2 = y1 + TILE_H
+                x1 = cc * TILE_W
+                x2 = x1 + TILE_W
+                mosaic[y1:y2, x1:x2] = tiles[k]
+                k += 1
+
+        cv2.imshow("CCTV Multi View", mosaic)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27: 
+            break
+
+    for r in readers:
+        r.stop()
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
