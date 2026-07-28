@@ -1,0 +1,387 @@
+import cv2
+import json
+import time
+import numpy as np
+import psycopg2
+import threading
+from datetime import datetime
+from ultralytics import YOLO
+
+# ======================================================================
+# KONFIGURASI
+# ======================================================================
+
+SLOTS_JSON_PATH = r"D:\Kuliah\Semester 6\TPT\Belajar Opencv_5\slots_baru\slots_cctv_3cam.json"
+
+# URL RTSP (Override)
+OVERRIDE_URLS = [
+    "rtsp://admin:TPT2025!@167.205.48.183/", # Camera 1
+    "rtsp://admin:TPT2025!@167.205.48.184/", # Camera 2
+    "rtsp://admin:TPT2025!@167.205.48.185/", # Camera 3
+]
+
+YOLO_MODEL_NAME = "yolo11m.pt" 
+
+SHOW           = True
+FRAME_STEP     = 120    # Deteksi setiap 30 frame
+CONF_THRESHOLD = 0.2
+ASSUMED_FPS    = 30.0
+
+# Resolusi Tampilan
+MAX_WIDTH  = 1920 
+MAX_HEIGHT = 1080
+
+# Grid Layout
+COLS = 2
+ROWS = 2
+TILE_W = MAX_WIDTH // COLS
+TILE_H = MAX_HEIGHT // ROWS
+
+# Classes (Car, Motorcycle, Bus, Truck)
+VEHICLE_CLASSES = [2, 3, 5, 7] 
+
+# DB Config
+DB_CONFIG = {
+    "host": "localhost",
+    "dbname": "postgres",
+    "user": "postgres",
+    "password": "123fikar",
+    "port": 5432,
+}
+DB_TABLE_NAME = "parking_occupancy"
+
+# ======================================================================
+# CLASS & UTILITAS
+# ======================================================================
+
+class StreamReader(threading.Thread):
+    def __init__(self, url, cam_id):
+        super().__init__(daemon=True)
+        self.url = url
+        self.cam_id = cam_id
+        self.cap = None
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ok = False
+        self.running = True
+
+    def open(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except:
+                pass
+        print(f"[INFO] Connecting to CAM {self.cam_id}...")
+        self.cap = cv2.VideoCapture(self.url)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except:
+            pass
+        self.ok = self.cap.isOpened()
+        return self.ok
+
+    def run(self):
+        while self.running:
+            if self.cap is None or not self.ok:
+                self.open()
+                if not self.ok:
+                    time.sleep(2.0)
+                    continue
+            ret, frm = self.cap.read()
+            if not ret or frm is None:
+                self.ok = False
+                time.sleep(0.5)
+                continue
+            with self.lock:
+                self.frame = frm
+
+    def get_frame(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+    def stop(self):
+        self.running = False
+        if self.cap is not None:
+            self.cap.release()
+
+def load_cameras_and_slots(json_path, override_urls=None):
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[ERROR] JSON: {e}")
+        return []
+
+    cameras_data = data.get("cameras", [])
+    if not cameras_data:
+        return []
+
+    parsed_cameras = []
+    for i, cam in enumerate(cameras_data):
+        cid = cam.get("camera_id", i)
+        
+        # Override URL Logic
+        if override_urls and i < len(override_urls):
+            url = override_urls[i]
+        else:
+            url = cam.get("rtsp_url", "")
+            
+        slots_raw = cam.get("slots", [])
+        slots = []
+        for s in slots_raw:
+            pts = np.array(s["points"], dtype=np.int32)
+            sid = s.get("id", 0)
+            M = cv2.moments(pts)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx, cy = np.mean(pts, axis=0).astype(int)
+
+            slots.append({"id": sid, "points": pts, "center": (cx, cy)})
+        
+        parsed_cameras.append({"id": cid, "url": url, "slots": slots})
+    return parsed_cameras
+
+def check_overlap(slot_polygon, point):
+    return cv2.pointPolygonTest(slot_polygon, point, False) >= 0
+
+def resize_with_letterbox(frame, target_w, target_h):
+    h, w = frame.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas[y:y+new_h, x:x+new_w] = resized
+    return canvas
+
+def make_placeholder(text, w, h):
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(img, text, (20, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+    return img
+
+def create_info_bar(width, height, total, occ, empty):
+    """Membuat bar informasi statistik global"""
+    bar = np.zeros((height, width, 3), dtype=np.uint8)
+    # Background abu-abu tua
+    bar[:] = (30, 30, 30) 
+    
+    text = f"TOTAL SPOTS: {total}   |   OCCUPIED: {occ}   |   EMPTY: {empty}"
+    
+    # Text styles
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.2
+    thickness = 3
+    color = (255, 255, 255)
+    
+    # Center text
+    text_size = cv2.getTextSize(text, font, scale, thickness)[0]
+    text_x = (width - text_size[0]) // 2
+    text_y = (height + text_size[1]) // 2
+    
+    cv2.putText(bar, text, (text_x, text_y), font, scale, color, thickness)
+    return bar
+
+# ======================================================================
+# DB FUNCTIONS
+# ======================================================================
+
+def init_db():
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE_NAME} (
+                id SERIAL PRIMARY KEY,
+                ts TIMESTAMPTZ NOT NULL,
+                occupied INTEGER,
+                empty INTEGER,
+                total_slots INTEGER
+            );
+        """)
+        conn.commit()
+        print("[INFO] DB Connected.")
+        return conn, cur
+    except Exception as e:
+        print(f"[WARN] DB Connection Failed: {e}")
+        return None, None
+
+def insert_occupancy(cur, conn, occupied, empty, total_slots):
+    try:
+        cur.execute(
+            f"INSERT INTO {DB_TABLE_NAME} (ts, occupied, empty, total_slots) VALUES (%s, %s, %s, %s);",
+            (datetime.now(), occupied, empty, total_slots)
+        )
+        conn.commit()
+        print(f"[DB SAVED] Total: {total_slots} | Occ: {occupied} | Empty: {empty}")
+    except Exception as e:
+        print(f"[ERROR] DB Insert: {e}")
+
+# ======================================================================
+# MAIN
+# ======================================================================
+
+def main():
+    conn, cur = init_db()
+
+    print(f"[INFO] Loading YOLO: {YOLO_MODEL_NAME}...")
+    model = YOLO(YOLO_MODEL_NAME)
+
+    print(f"[INFO] Loading JSON & Cams...")
+    cameras_config = load_cameras_and_slots(SLOTS_JSON_PATH, override_urls=OVERRIDE_URLS)
+    
+    if not cameras_config:
+        print("ERROR: No camera data.")
+        return
+
+    # Start Streams
+    readers = []
+    for cfg in cameras_config:
+        r = StreamReader(cfg["url"], cfg["id"])
+        r.start()
+        readers.append(r)
+        
+        # Init State
+        cfg["last_slot_taken"] = [False] * len(cfg["slots"])
+        cfg["last_occupied_count"] = 0
+        cfg["last_boxes"] = []
+        cfg["last_points"] = []
+
+    if SHOW:
+        cv2.namedWindow("Multi-Camera Parking", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Multi-Camera Parking", MAX_WIDTH, MAX_HEIGHT)
+
+    frame_idx = 0
+
+    try:
+        while True:
+            frame_idx += 1
+            
+            # Reset counter global untuk frame ini
+            global_occupied = 0
+            global_slots = 0
+            
+            vis_tiles = [] 
+            
+            for i, cfg in enumerate(cameras_config):
+                reader = readers[i]
+                raw_frame = reader.get_frame()
+                
+                # --- KAMERA MATI ---
+                if raw_frame is None:
+                    txt = f"CAM {cfg['id']} No Signal"
+                    vis_tiles.append(make_placeholder(txt, TILE_W, TILE_H))
+                    continue
+
+                # --- KAMERA HIDUP ---
+                
+                # 1. DETEKSI (Throttled)
+                if frame_idx % FRAME_STEP == 0:
+                    temp_boxes = []
+                    temp_points = []
+                    try:
+                        res = model.predict(raw_frame, conf=CONF_THRESHOLD, verbose=False, classes=VEHICLE_CLASSES)
+                        for r in res:
+                            for box in r.boxes:
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                
+                                # Titik jangkar (Kaki kendaraan)
+                                cx = int((x1 + x2) / 2)
+                                h_box = y2 - y1
+                                cy = int(y1 + (h_box * 0.75))
+                                
+                                temp_boxes.append((int(x1), int(y1), int(x2), int(y2)))
+                                temp_points.append((cx, cy))
+                    except Exception as e:
+                        print(f"Err Detect Cam {cfg['id']}: {e}")
+                    
+                    cfg["last_boxes"] = temp_boxes
+                    cfg["last_points"] = temp_points
+                    
+                    # Cek Overlap Slot
+                    current_slot_taken = []
+                    for s in cfg["slots"]:
+                        is_occ = False
+                        for pt in temp_points:
+                            if check_overlap(s["points"], pt):
+                                is_occ = True
+                                break
+                        current_slot_taken.append(is_occ)
+                    
+                    cfg["last_slot_taken"] = current_slot_taken
+                    cfg["last_occupied_count"] = sum(current_slot_taken)
+
+                # 2. AKUMULASI STATISTIK
+                global_occupied += cfg["last_occupied_count"]
+                global_slots += len(cfg["slots"])
+
+                # 3. VISUALISASI FRAME
+                vis = raw_frame.copy()
+                
+                # A. Gambar Slot (Merah/Hijau)
+                for idx_s, s in enumerate(cfg["slots"]):
+                    color = (0, 0, 255) if cfg["last_slot_taken"][idx_s] else (0, 255, 0)
+                    cv2.polylines(vis, [s["points"]], True, color, 2)
+                
+                # B. Gambar Bounding Box & Titik Kuning (Kendaraan)
+                for box, pt in zip(cfg["last_boxes"], cfg["last_points"]):
+                    # Kotak Kuning Tipis
+                    cv2.rectangle(vis, (box[0], box[1]), (box[2], box[3]), (0, 255, 255), 2)
+                    # Titik Kuning Solid (Centroid)
+                    cv2.circle(vis, pt, 6, (0, 255, 255), -1)
+
+                # C. Label ID Kamera (Kecil di pojok)
+                cv2.rectangle(vis, (0,0), (180, 40), (0,0,0), -1)
+                cv2.putText(vis, f"CAM {cfg['id']}", (10,30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+
+                vis_tiles.append(resize_with_letterbox(vis, TILE_W, TILE_H))
+
+            # --- HITUNG SISA (EMPTY) ---
+            global_empty = global_slots - global_occupied
+
+            # --- UPDATE DATABASE (Throttled) ---
+            if frame_idx % FRAME_STEP == 0:
+                if conn and cur:
+                    insert_occupancy(cur, conn, global_occupied, global_empty, global_slots)
+
+            # --- DISPLAY MOSAIC + INFO BAR ---
+            if SHOW:
+                # Isi placeholder jika kamera < 4
+                while len(vis_tiles) < ROWS * COLS:
+                    vis_tiles.append(make_placeholder("NO CAM", TILE_W, TILE_H))
+                
+                # Susun Grid Video
+                row1 = np.hstack([vis_tiles[0], vis_tiles[1]])
+                row2 = np.hstack([vis_tiles[2], vis_tiles[3]])
+                video_grid = np.vstack([row1, row2])
+                
+                # Buat Info Bar (Dashboard) di Bawah
+                info_h = 80 # Tinggi bar informasi
+                info_bar = create_info_bar(MAX_WIDTH, info_h, global_slots, global_occupied, global_empty)
+                
+                # Gabungkan Video + Info Bar
+                final_display = np.vstack([video_grid, info_bar])
+                
+                # Resize agar pas di layar jika perlu (optional, karena window normal)
+                cv2.imshow("Multi-Camera Parking", final_display)
+                
+                if cv2.waitKey(1) & 0xFF == 27: # ESC
+                    break
+
+    except KeyboardInterrupt:
+        print("[INFO] Stopped.")
+    finally:
+        for r in readers:
+            r.stop()
+        cv2.destroyAllWindows()
+        if conn:
+            cur.close()
+            conn.close()
+        print("[INFO] Done.")
+
+if __name__ == "__main__":
+    main()
