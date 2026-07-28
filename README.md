@@ -28,16 +28,19 @@ Model bobot (*weights*) YOLO dapat diunduh melalui link Google Drive berikut:
 
 ## 🚀 Cara Menjalankan
 
-1. **Clone Repositori:**
+1. **WiFI:**
+   ```bash
+   Connect ke ITB Hotspot
+2. **Clone Repositori:**
    ```bash
    git clone [https://github.com/Skyrunner2806/TPT-Kelompok-7.git](https://github.com/Skyrunner2806/TPT-Kelompok-7.git)
    cd TPT-Kelompok-7
-2. **Library yang dibutuhkan:**
+3. **Library yang dibutuhkan:**
    ```bash
    pip install opencv-python ultralytics numpy mysql-connector-python
-3. **Unduh model yang dubutuhkan:**
+4. **Unduh model yang dubutuhkan:**
    ```bash
    Unduh file bobot YOLO dari link Google Drive di atas dan letakkan di dalam folder utama projek.
-4. Jalankan Skrip Utama:
+5. Jalankan Skrip Utama:
    ```bash
    python main_yolo_db
