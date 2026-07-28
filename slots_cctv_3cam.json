@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "layout": {
+      "rows": 2,
+      "cols": 2,
+      "tile_size": [
+        540,
+        960
+      ]
+    },
+    "saved_at_unix": 1766471738
+  },
+  "cameras": [
+    {
+      "camera_id": 1,
+      "rtsp_url": "rtsp://admin:TPT2025!@167.205.48.183/",
+      "image_size": [
+        1080,
+        1920
+      ],
+      "slots": []
+    },
+    {
+      "camera_id": 2,
+      "rtsp_url": "rtsp://admin:TPT2025!@167.205.48.184/",
+      "image_size": [
+        1080,
+        1920
+      ],
+      "slots": []
+    },
+    {
+      "camera_id": 3,
+      "rtsp_url": "rtsp://admin:TPT2025!@167.205.48.185/",
+      "image_size": [
+        1080,
+        1920
+      ],
+      "slots": []
+    }
+  ]
+}
