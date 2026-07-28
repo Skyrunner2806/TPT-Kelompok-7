@@ -1,10 +1,3 @@
----
-
-### 2. `README.md` untuk Branch `web-dashboard`
-
-> **Instruksi:** Buat atau perbarui file `README.md` di branch `web-dashboard` dengan konten berikut:
-
-```markdown
 # TPT Kelompok 7 - Web Dashboard Monitoring
 
 Branch ini berisi aplikasi antarmuka web (*Web Dashboard*) berbasis Flask untuk memvisualisasikan status parkir dan informasi profil kelompok TPT Kelompok 7.
