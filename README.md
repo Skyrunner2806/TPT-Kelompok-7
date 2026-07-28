@@ -16,7 +16,7 @@ Projek Tugas TPT Kelompok 7 untuk sistem deteksi okupansi slot parkir berbasis v
 * `main_yolo_db` : Skrip utama deteksi okupansi slot parkir menggunakan YOLO terhubung ke sistem database.
 * `masking` : Tool/skrip anotasi untuk pembuatan *mask* / slot zona parkir berbasis RTSP.
 * `test_cctv` : Skrip pengujian dan visualisasi *streaming* multi-view dari beberapa kamera CCTV.
-* `slots_cctv_3cam.json` : File konfigurasi koordint/titik slot parkir untuk 3 sudut kamera CCTV.
+* `slots_cctv_3cam.json` : File konfigurasi koordinat/titik slot parkir untuk 3 sudut kamera CCTV.
 
 ---
 
