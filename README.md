@@ -28,7 +28,7 @@ Model bobot (*weights*) YOLO dapat diunduh melalui link Google Drive berikut:
 
 ## 🚀 Cara Menjalankan
 
-1. **WiFI:**
+1. **WiFi:**
    ```bash
    Connect ke ITB Hotspot
 2. **Clone Repositori:**
