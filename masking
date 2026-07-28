@@ -1,0 +1,333 @@
+import cv2
+import json
+import numpy as np
+import time
+from pathlib import Path
+
+# ================== KONFIGURASI ==================
+URLS = [
+    "rtsp://admin:TPT2025!@167.205.48.183/",
+    "rtsp://admin:TPT2025!@167.205.48.184/",
+    "rtsp://admin:TPT2025!@167.205.48.185/",
+]
+
+OUTPUT_JSON = r"D:\Kuliah\Semester 6\TPT\Belajar Opencv_5\slots_baru\slots_cctv_3cam.json"
+
+MAX_WIDTH = 1920
+MAX_HEIGHT = 1080
+COLS = 2
+ROWS = 2
+TILE_W = MAX_WIDTH // COLS
+TILE_H = MAX_HEIGHT // ROWS
+
+HELP_TEXT = """\
+[Parking Slot Annotator - 3 CCTV (Snapshot)]
+Klik kiri  : tambah titik (di tile cam yang diklik)
+ENTER / c  : tutup poligon (cam aktif)
+u          : undo titik terakhir (cam aktif)
+d          : hapus slot terakhir (cam aktif)
+s          : simpan JSON (semua cam)
+r          : re-snapshot semua kamera (ambil ulang 1 frame)
+q / ESC    : simpan & keluar
+h          : toggle help
+"""
+
+
+# ================== UTIL ==================
+def make_placeholder(text, w=TILE_W, h=TILE_H):
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    if text:
+        cv2.putText(img, text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    return img
+
+
+def letterbox_params(src_w, src_h, target_w, target_h):
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
+    pad_x = (target_w - new_w) // 2
+    pad_y = (target_h - new_h) // 2
+    return scale, new_w, new_h, pad_x, pad_y
+
+
+def resize_with_letterbox(frame, target_w, target_h):
+    h, w = frame.shape[:2]
+    if h == 0 or w == 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    scale, new_w, new_h, pad_x, pad_y = letterbox_params(w, h, target_w, target_h)
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+    return canvas
+
+
+def draw_help(img):
+    y0 = 70
+    pad = 22
+    lines = HELP_TEXT.strip().splitlines()
+    box_w = 720
+    box_h = pad * len(lines) + 25
+    cv2.rectangle(img, (10, y0 - 25), (10 + box_w, y0 - 25 + box_h), (0, 0, 0), -1)
+    for i, line in enumerate(lines):
+        y = y0 + i * pad
+        cv2.putText(img, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def grab_one_frame(rtsp_url, tries=80, warmup_discard=5):
+    """
+    Ambil 1 frame dari RTSP.
+    - tries: berapa kali coba read
+    - warmup_discard: buang beberapa frame awal (kadang masih gelap/blur)
+    """
+    cap = cv2.VideoCapture(rtsp_url)
+    if not cap.isOpened():
+        return None, f"Gagal membuka stream: {rtsp_url}"
+
+    # buang beberapa frame awal
+    for _ in range(warmup_discard):
+        cap.read()
+
+    frame = None
+    for _ in range(tries):
+        ok, frm = cap.read()
+        if ok and frm is not None and frm.size > 0:
+            frame = frm
+            break
+
+    cap.release()
+    if frame is None:
+        return None, f"Gagal membaca frame dari stream: {rtsp_url}"
+    return frame, None
+
+
+# ================== APP ==================
+def main():
+    # Ambil snapshot 1 frame untuk tiap kamera (sekali di awal)
+    frames = []
+    for i, url in enumerate(URLS, start=1):
+        print(f"[INFO] Mengambil snapshot CAM {i} ...")
+        frm, err = grab_one_frame(url)
+        if err:
+            print("[WARN]", err)
+            frames.append(None)
+        else:
+            frames.append(frm)
+
+    slots_per_cam = [[] for _ in URLS]
+    current_points = [[] for _ in URLS]
+    active_cam = 0
+    show_help = True
+
+    transform_per_cam = [None for _ in URLS]  # untuk mapping klik (tile->frame)
+
+    window_name = "Annotate Parking Slots - 3 CCTV (Snapshot)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, MAX_WIDTH, MAX_HEIGHT)
+
+    def tile_index_from_xy(x, y):
+        col = x // TILE_W
+        row = y // TILE_H
+        if col < 0 or col >= COLS or row < 0 or row >= ROWS:
+            return None
+        return row * COLS + col
+
+    def mosaic_xy_to_cam_xy(cam_idx, x_mosaic, y_mosaic):
+        t = transform_per_cam[cam_idx]
+        if t is None:
+            return None
+
+        tile_pos = cam_idx  # cam 0..2 dipetakan ke tile 0..2
+        row = tile_pos // COLS
+        col = tile_pos % COLS
+        x_tile = x_mosaic - col * TILE_W
+        y_tile = y_mosaic - row * TILE_H
+
+        pad_x, pad_y = t["pad_x"], t["pad_y"]
+        new_w, new_h = t["new_w"], t["new_h"]
+        scale = t["scale"]
+
+        # klik harus di area gambar (bukan padding)
+        if not (pad_x <= x_tile < pad_x + new_w and pad_y <= y_tile < pad_y + new_h):
+            return None
+
+        x_src = int((x_tile - pad_x) / scale)
+        y_src = int((y_tile - pad_y) / scale)
+
+        x_src = max(0, min(t["src_w"] - 1, x_src))
+        y_src = max(0, min(t["src_h"] - 1, y_src))
+        return x_src, y_src
+
+    def mouse_event(event, x, y, flags, param):
+        nonlocal active_cam
+        if event == cv2.EVENT_LBUTTONDOWN:
+            idx = tile_index_from_xy(x, y)
+            if idx is None or idx >= len(URLS):
+                return
+            active_cam = idx
+            pt = mosaic_xy_to_cam_xy(active_cam, x, y)
+            if pt is None:
+                return
+            cx, cy = pt
+            current_points[active_cam].append([int(cx), int(cy)])
+
+    cv2.setMouseCallback(window_name, mouse_event)
+
+    def save_json():
+        data = {
+            "meta": {
+                "mode": "snapshot",
+                "layout": {"rows": ROWS, "cols": COLS, "tile_size": [TILE_H, TILE_W]},
+                "saved_at_unix": int(time.time()),
+            },
+            "cameras": []
+        }
+
+        for i, url in enumerate(URLS):
+            frm = frames[i]
+            img_size = [int(frm.shape[0]), int(frm.shape[1])] if frm is not None else None
+
+            data["cameras"].append({
+                "camera_id": i + 1,
+                "rtsp_url": url,
+                "image_size": img_size,
+                "slots": [
+                    {"id": si + 1, "points": slot["points"]}
+                    for si, slot in enumerate(slots_per_cam[i])
+                ]
+            })
+
+        Path(OUTPUT_JSON).parent.mkdir(parents=True, exist_ok=True)
+        with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"[✅] Disimpan ke: {OUTPUT_JSON}")
+
+    def refresh_snapshots():
+        nonlocal frames
+        print("[INFO] Re-snapshot semua kamera...")
+        new_frames = []
+        for i, url in enumerate(URLS, start=1):
+            print(f"[INFO] Mengambil snapshot CAM {i} ...")
+            frm, err = grab_one_frame(url)
+            if err:
+                print("[WARN]", err)
+                new_frames.append(None)
+            else:
+                new_frames.append(frm)
+        frames = new_frames
+        print("[INFO] Snapshot diperbarui.")
+
+    print("Instruksi:\n" + HELP_TEXT)
+    print("Mode snapshot: hanya ambil 1 frame per kamera, lalu anotasi di gambar statis.")
+
+    while True:
+        mosaic = np.zeros((TILE_H * ROWS, TILE_W * COLS, 3), dtype=np.uint8)
+        tiles = []
+
+        for i in range(len(URLS)):
+            frm = frames[i]
+            if frm is None:
+                tiles.append(make_placeholder(f"CAM {i+1}: NO SIGNAL"))
+                transform_per_cam[i] = None
+                continue
+
+            src_h, src_w = frm.shape[:2]
+            scale, new_w, new_h, pad_x, pad_y = letterbox_params(src_w, src_h, TILE_W, TILE_H)
+            transform_per_cam[i] = {
+                "scale": scale, "new_w": new_w, "new_h": new_h,
+                "pad_x": pad_x, "pad_y": pad_y,
+                "src_w": src_w, "src_h": src_h
+            }
+
+            overlay = frm.copy()
+
+            # slot hijau
+            for si, slot in enumerate(slots_per_cam[i], start=1):
+                pts = np.array(slot["points"], np.int32)
+                if len(pts) >= 3:
+                    cv2.polylines(overlay, [pts], True, (0, 255, 0), 2)
+                    cx = int(np.mean(pts[:, 0])); cy = int(np.mean(pts[:, 1]))
+                    cv2.putText(overlay, str(si), (cx, cy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # polygon aktif oranye
+            if current_points[i]:
+                pts = np.array(current_points[i], np.int32)
+                cv2.polylines(overlay, [pts], False, (0, 165, 255), 2)
+                for (px, py) in current_points[i]:
+                    cv2.circle(overlay, (px, py), 4, (0, 165, 255), -1)
+
+            tile = resize_with_letterbox(overlay, TILE_W, TILE_H)
+
+            cv2.putText(tile, f"CAM {i+1}", (15, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+
+            if i == active_cam:
+                cv2.rectangle(tile, (5, 5), (TILE_W - 6, TILE_H - 6), (255, 255, 0), 3)
+                cv2.putText(tile, "ACTIVE", (15, 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2, cv2.LINE_AA)
+
+            tiles.append(tile)
+
+        # slot ke-4 kosong
+        while len(tiles) < ROWS * COLS:
+            tiles.append(make_placeholder(""))
+
+        k = 0
+        for rr in range(ROWS):
+            for cc in range(COLS):
+                y1 = rr * TILE_H
+                y2 = y1 + TILE_H
+                x1 = cc * TILE_W
+                x2 = x1 + TILE_W
+                mosaic[y1:y2, x1:x2] = tiles[k]
+                k += 1
+
+        if show_help:
+            draw_help(mosaic)
+
+        cv2.imshow(window_name, mosaic)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key in (13, ord('c')):  # close polygon cam aktif
+            pts = current_points[active_cam]
+            if len(pts) >= 3:
+                slots_per_cam[active_cam].append({"points": pts.copy()})
+                current_points[active_cam].clear()
+                print(f"CAM {active_cam+1}: Slot ditambahkan. Total slot: {len(slots_per_cam[active_cam])}")
+            else:
+                print(f"CAM {active_cam+1}: Minimal 3 titik untuk 1 slot!")
+
+        elif key == ord('u'):
+            if current_points[active_cam]:
+                current_points[active_cam].pop()
+                print(f"CAM {active_cam+1}: Undo titik terakhir.")
+            else:
+                print(f"CAM {active_cam+1}: Tidak ada titik untuk dihapus.")
+
+        elif key == ord('d'):
+            if slots_per_cam[active_cam]:
+                slots_per_cam[active_cam].pop()
+                print(f"CAM {active_cam+1}: Slot terakhir dihapus. Sisa slot: {len(slots_per_cam[active_cam])}")
+            else:
+                print(f"CAM {active_cam+1}: Belum ada slot.")
+
+        elif key == ord('s'):
+            save_json()
+
+        elif key == ord('r'):
+            refresh_snapshots()
+
+        elif key == ord('h'):
+            show_help = not show_help
+
+        elif key in (ord('q'), 27):
+            save_json()
+            break
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
