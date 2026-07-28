@@ -40,4 +40,4 @@ Model bobot (*weights*) YOLO dapat diunduh melalui link Google Drive berikut:
    Unduh file bobot YOLO dari link Google Drive di atas dan letakkan di dalam folder utama projek.
 4. Jalankan Skrip Utama:
    ```bash
-   Jalankan Skrip Utama:
+   python main_yolo_db
